@@ -93,6 +93,10 @@ BarWidget {
       if (root.windowEvents.indexOf(name) !== -1) {
         Hyprland.refreshToplevels()
         root.revision++
+        if (name === "openwindow" || name === "closewindow") {
+          root.refreshLive()
+          settleTimer.restart()
+        }
       } else if (root.workspaceEvents.indexOf(name) !== -1) {
         Hyprland.refreshWorkspaces()
         if (name === "configreloaded" && root.rulesNeeded) root.refreshRules()
@@ -105,11 +109,90 @@ BarWidget {
     }
   }
 
+  // Very short-lived windows (e.g. JetBrains internal popup frames that open
+  // and close within a couple hundred ms) can have their closewindow event
+  // dropped by the IPC stream, leaving a ghost icon that no later event ever
+  // clears. A periodic resync against Hyprland's live state self-heals that
+  // without needing a shell restart.
+  //
+  // The refresh fired by the event itself can race with the open/close burst
+  // of a splash (PyCharm, GitKraken) and still see the window, so settleTimer
+  // does one more refresh once the burst has gone quiet.
+  Timer {
+    id: settleTimer
+    interval: 400
+    onTriggered: {
+      Hyprland.refreshToplevels()
+      Hyprland.refreshWorkspaces()
+      root.refreshLive()
+      root.revision++
+    }
+  }
+
+  Timer {
+    interval: 15000
+    running: true
+    repeat: true
+    onTriggered: {
+      Hyprland.refreshToplevels()
+      Hyprland.refreshWorkspaces()
+      root.refreshLive()
+      root.revision++
+    }
+  }
+
+  // Quickshell's refreshToplevels() adds and updates toplevels but never drops
+  // one that has left `hyprctl clients`: a splash whose openwindow was seen
+  // and whose closewindow was missed stays in workspace.toplevels forever, as
+  // an icon-less ghost. So the list is checked against the live client
+  // addresses, which is the only authoritative source.
+  property var liveAddresses: ({})
+  property bool liveKnown: false
+
+  function refreshLive() {
+    if (!liveProc.running) liveProc.running = true
+  }
+
+  function addressKey(address) {
+    return String(address || "").replace(/^0x/, "").toLowerCase()
+  }
+
+  function liveToplevels(workspace) {
+    var _ = root.revision
+    var tops = workspace && workspace.toplevels ? workspace.toplevels.values : null
+    if (!tops) return []
+    if (!root.liveKnown) return tops
+    return tops.filter(function (top) { return root.liveAddresses[root.addressKey(top.address)] === true })
+  }
+
+  Process {
+    id: liveProc
+    command: ["hyprctl", "-j", "clients"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var listed
+        try {
+          listed = JSON.parse(text || "[]")
+        } catch (e) {
+          return
+        }
+        if (!Array.isArray(listed)) return
+        var next = {}
+        for (var i = 0; i < listed.length; i++) {
+          if (listed[i] && listed[i].mapped !== false) next[root.addressKey(listed[i].address)] = true
+        }
+        root.liveAddresses = next
+        root.liveKnown = true
+        root.revision++
+      }
+    }
+  }
+
   // --- model ---------------------------------------------------------------
   function hasWindows(workspace) {
     if (!workspace) return false
-    var tops = workspace.toplevels ? workspace.toplevels.values : null
-    return !!tops && tops.length > 0
+    return root.liveToplevels(workspace).length > 0
   }
 
   // Hyprland reports the owning monitor as an object on the workspace and as a
@@ -151,7 +234,10 @@ BarWidget {
   }
 
   onRulesNeededChanged: if (root.rulesNeeded && !root.rulesLoaded) root.refreshRules()
-  Component.onCompleted: if (root.rulesNeeded) root.refreshRules()
+  Component.onCompleted: {
+    root.refreshLive()
+    if (root.rulesNeeded) root.refreshRules()
+  }
 
   function ruleMonitorMatches(spec, mine, mineDesc) {
     if (!spec) return false
@@ -359,8 +445,8 @@ BarWidget {
 
   function iconsFor(workspace) {
     if (!root.showIcons || !workspace) return ""
-    var tops = workspace.toplevels ? workspace.toplevels.values : null
-    if (!tops || tops.length === 0) return ""
+    var tops = root.liveToplevels(workspace)
+    if (tops.length === 0) return ""
 
     var shown = root.maxIcons > 0 ? Math.min(tops.length, root.maxIcons) : tops.length
     var icons = []
